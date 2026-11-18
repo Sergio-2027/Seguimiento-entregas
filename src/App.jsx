@@ -320,3 +320,4 @@ export default function App() {
   useEffect(() => { const f = () => setRuta(location.hash); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f) }, [])
   return ruta === '#/chofer' ? <Chofer /> : <Tablero />
 }
+
