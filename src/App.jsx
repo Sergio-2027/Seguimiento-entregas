@@ -1,12 +1,14 @@
 import { useEffect, useState, useRef, useMemo } from 'react'
 import { createClient } from '@supabase/supabase-js'
 import DeckGL from '@deck.gl/react'
-import { TileLayer } from '@deck.gl/geo-layers'
+import { TileLayer, TripsLayer } from '@deck.gl/geo-layers'
 import { BitmapLayer, ScatterplotLayer, LineLayer, TextLayer } from '@deck.gl/layers'
 import { HeatmapLayer } from '@deck.gl/aggregation-layers'
 
 const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_KEY)
 
+const MAPA_URL = 'https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'  // mapa base oscuro (CARTO / OpenStreetMap)
+const ATRIB = { position: 'absolute', zIndex: 1, right: 6, bottom: 4, fontSize: 11, color: '#cbd5e1', background: '#0f172acc', padding: '1px 6px', borderRadius: 4 }
 const COLOR = { 'Pendiente': [150,150,150], 'En camino': [255,140,0], 'Entregado': [30,160,70] }
 
 // ---- Gemelo digital: parámetros y cálculos ----
@@ -84,7 +86,7 @@ function Tablero() {
 
   const layers = [
     new TileLayer({
-      data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', minZoom: 0, maxZoom: 19, tileSize: 256,
+      data: MAPA_URL, minZoom: 0, maxZoom: 19, tileSize: 256,
       renderSubLayers: p => {
         const { west, south, east, north } = p.tile.bbox
         return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] })
@@ -104,17 +106,18 @@ function Tablero() {
 
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
-      <div style={{ position: 'absolute', zIndex: 2, top: 0, left: 0, right: 0, background: '#fff', padding: 12, boxShadow: '0 2px 6px #0003' }}>
-        <h2 style={{ margin: 0 }}>Seguimiento de Entregas en Vivo</h2>
-        <div style={{ display: 'flex', gap: 24, marginTop: 8, flexWrap: 'wrap' }}>
-          {kpis.map(([l, v]) => <div key={l}><b style={{ fontSize: 28 }}>{v}</b><div style={{ fontSize: 12 }}>{l}</div></div>)}
-          <span style={{ marginLeft: 'auto', alignSelf: 'center', display: 'flex', gap: 16 }}><a href="#/flota">Flota y optimización →</a><a href="#/chofer">App chofer →</a></span>
+      <div style={{ position: 'absolute', zIndex: 2, top: 0, left: 0, right: 0, background: '#0f172a', color: '#e2e8f0', padding: '10px 14px', boxShadow: '0 2px 10px #0008' }}>
+        <h2 style={{ margin: 0, fontSize: 20 }}>Seguimiento de Entregas en Vivo <span style={{ color: '#4ade80', fontSize: 12, marginLeft: 8 }}>● EN VIVO</span></h2>
+        <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+          {kpis.map(([l, v]) => <div key={l} style={{ background: '#1e293b', borderRadius: 10, padding: '8px 14px', minWidth: 90 }}><b style={{ fontSize: 24 }}>{v}</b><div style={{ fontSize: 11, color: '#94a3b8' }}>{l}</div></div>)}
+          <span style={{ marginLeft: 'auto', alignSelf: 'center', display: 'flex', gap: 16 }}><a href="#/flota" style={{ color: '#38bdf8' }}>Flota y optimización →</a><a href="#/chofer" style={{ color: '#38bdf8' }}>App chofer →</a></span>
         </div>
       </div>
 
       <DeckGL initialViewState={{ longitude: -58.43, latitude: -34.60, zoom: 11.5 }} controller layers={layers}
         getTooltip={({ object: o }) => o && `Pedido: ${o.pedido}\nCliente: ${o.cliente}\nEstado: ${o.estado}\nChofer: ${o.chofer || '-'}\nKm recorridos: ${(o.km_recorridos || 0).toFixed(1)}`} />
 
+      <div style={ATRIB}>© OpenStreetMap · © CARTO</div>
       {/* Panel del gemelo digital */}
       <div style={{ position: 'absolute', zIndex: 2, left: 0, right: 0, bottom: 0, background: '#fff',
         boxShadow: '0 -2px 6px #0003', padding: 12, maxHeight: abierto ? '42%' : 'auto', overflowY: 'auto' }}>
@@ -322,11 +325,16 @@ function estadisticas(filas) {
     km, horas: km / VEL_FLOTA, litros, co2: litros * CO2_L, fin: Math.max(...filas.map(f => f.hora)) }
 }
 
-/* ---------------- FLOTA: mapa de calor animado + optimización ---------------- */
+/* ---------------- FLOTA: centro de control con mapa de calor y estelas ---------------- */
 const hh = h => { const m = Math.round(h * 60); return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0') }
-const TABLA = [['Unidades en ruta', 'unidades', 0], ['Viajes realizados', 'viajes', 0], ['Km recorridos', 'km', 0],
-  ['Horas de conducción', 'horas', 1], ['Combustible (L)', 'litros', 0], ['CO₂ emitido (kg)', 'co2', 0]]
 const T0 = 5.8
+const PALETA = [[56,189,248],[167,139,250],[244,114,182],[251,146,60],[250,204,21],[74,222,128],[45,212,191],[248,113,113]]
+const C = { fondo: '#0f172a', tarjeta: '#1e293b', texto: '#e2e8f0', suave: '#94a3b8', azul: '#38bdf8', verde: '#4ade80', rojo: '#f87171' }
+const KPI = [['Unidades', 'unidades', 0, ''], ['Viajes', 'viajes', 0, ''], ['Recorrido', 'km', 0, ' km'], ['Combustible', 'litros', 0, ' L']]
+const BARRAS = [['Kilómetros', 'km', ' km'], ['Combustible', 'litros', ' L'], ['CO₂ emitido', 'co2', ' kg']]
+const boton = (act, ext = {}) => ({ padding: '9px 12px', borderRadius: 8, border: '1px solid #334155', cursor: 'pointer', fontWeight: 600,
+  background: act ? C.azul : C.tarjeta, color: act ? '#0f172a' : C.texto, ...ext })
+const barra = { borderRadius: 4, padding: '2px 8px', fontSize: 12, marginTop: 3, whiteSpace: 'nowrap', minWidth: 110 }
 
 function Flota() {
   const [filas, setFilas] = useState([])
@@ -336,6 +344,7 @@ function Flota() {
   const [t, setT] = useState(T0)
   const [play, setPlay] = useState(true)
   const [acum, setAcum] = useState(false)
+  const movil = window.innerWidth < 700
 
   const cargar = async () => {
     let out = [], desde = 0
@@ -376,7 +385,7 @@ function Flota() {
       stats: { actual: p.actual.length ? estadisticas(p.actual) : null, optimizado: p.optimizado.length ? estadisticas(p.optimizado) : null } }
   }, [filas])
   const activos = porPlan[plan]
-  const A = stats.actual, B = stats.optimizado
+  const A = stats.actual, B = stats.optimizado, cur = stats[plan], vs = plan === 'optimizado' ? A : null
 
   useEffect(() => {
     if (!play) return
@@ -389,83 +398,100 @@ function Flota() {
     activos.forEach(f => { (g[f.unidad + '-' + f.viaje] ||= []).push(f) })
     return Object.values(g).map(a => a.sort((x, y) => x.orden - y.orden))
   }, [activos])
+  const viajes = useMemo(() => grupos.map(a => ({ unidad: a[0].unidad, path: a.map(f => [f.lng, f.lat]), ts: a.map(f => f.hora) })), [grupos])
   const camiones = grupos.map(a => { let p = null; for (const f of a) { if (f.hora <= t) p = f; else break } return p && t - p.hora < 0.3 ? p : null }).filter(Boolean)
   const calor = activos.filter(f => f.hora <= t && f.hora > t - (acum ? 99 : 0.75))
+  const color = d => PALETA[(d.unidad - 1) % 8]
 
   const layers = [
     new TileLayer({
-      data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', minZoom: 0, maxZoom: 19, tileSize: 256,
+      data: MAPA_URL, minZoom: 0, maxZoom: 19, tileSize: 256,
       renderSubLayers: p => {
         const { west, south, east, north } = p.tile.bbox
         return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] })
       }
     }),
     ...(calor.length ? [new HeatmapLayer({ id: 'calor', data: calor, getPosition: d => [d.lng, d.lat], getWeight: 1,
-      radiusPixels: 32, intensity: 2, threshold: 0.04 })] : []),
-    new ScatterplotLayer({ id: 'deposito', data: [DEPOSITO], getPosition: d => [d.lng, d.lat], getFillColor: [10, 108, 255],
-      getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 3, getRadius: 12, radiusUnits: 'pixels' }),
-    new ScatterplotLayer({ id: 'camiones', data: camiones, getPosition: d => [d.lng, d.lat], getFillColor: [30, 30, 30],
-      getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 2, getRadius: 10, radiusUnits: 'pixels' }),
+      radiusPixels: 34, intensity: 2, threshold: 0.04 })] : []),
+    new TripsLayer({ id: 'estelas', data: viajes, getPath: d => d.path, getTimestamps: d => d.ts, getColor: color,
+      currentTime: t, trailLength: 0.6, fadeTrail: true, widthMinPixels: 4, capRounded: true, jointRounded: true }),
+    new ScatterplotLayer({ id: 'deposito', data: [DEPOSITO], getPosition: d => [d.lng, d.lat], getFillColor: [56, 189, 248],
+      getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 3, getRadius: 13, radiusUnits: 'pixels' }),
+    new ScatterplotLayer({ id: 'camiones', data: camiones, getPosition: d => [d.lng, d.lat], getFillColor: color,
+      getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 2, getRadius: 11, radiusUnits: 'pixels' }),
     new TextLayer({ id: 'unidades', data: camiones, getPosition: d => [d.lng, d.lat], getText: d => String(d.unidad),
-      getSize: 12, getColor: [255, 255, 255] }),
+      getSize: 12, getColor: [15, 23, 42] }),
   ]
 
-  const bt = (extra = {}) => ({ padding: '8px 12px', borderRadius: 6, border: '1px solid #999', background: '#fff', cursor: 'pointer', ...extra })
+  const panel = movil ? { left: 0, right: 0, bottom: 0, maxHeight: '60%' } : { top: 0, bottom: 0, left: 0, width: 400 }
+  const lk = { color: C.azul }
   return (
     <div style={{ position: 'fixed', inset: 0 }}>
-      <DeckGL initialViewState={{ longitude: -58.65, latitude: -34.48, zoom: 9.6 }} controller layers={layers} />
-      <div style={{ position: 'absolute', zIndex: 2, left: 0, right: 0, bottom: 0, background: '#fff',
-        boxShadow: '0 -2px 6px #0003', padding: 12, maxHeight: '58%', overflowY: 'auto', fontSize: 14 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <b style={{ fontSize: 16 }}>Flota y optimización de rutas</b>
-          <span style={{ marginLeft: 'auto', display: 'flex', gap: 14 }}><a href="#/">Tablero</a><a href="#/chofer">App chofer</a></span>
+      <DeckGL initialViewState={movil ? { longitude: -58.65, latitude: -34.62, zoom: 8.8 } : { longitude: -58.83, latitude: -34.48, zoom: 9.6 }}
+        controller layers={layers} />
+      <div style={ATRIB}>© OpenStreetMap · © CARTO</div>
+      <div style={{ position: 'absolute', zIndex: 2, ...panel, background: C.fondo, color: C.texto, padding: 16, overflowY: 'auto', fontSize: 14, boxShadow: '0 0 18px #0008' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div><div style={{ fontSize: 18, fontWeight: 700 }}>Flota y optimización</div>
+            <div style={{ color: C.suave, fontSize: 12 }}>Gemelo digital · Depósito General Pacheco</div></div>
+          <span style={{ marginLeft: 'auto', display: 'flex', gap: 12, fontSize: 13 }}><a href="#/" style={lk}>Tablero</a><a href="#/chofer" style={lk}>Chofer</a></span>
         </div>
-        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-          <button disabled={ocupado} onClick={generar} style={bt()}>Generar recorridos (8 unidades)</button>
-          <button disabled={ocupado || !A} onClick={optimizar} style={bt({ background: '#0a6cff', color: '#fff', border: 0 })}>Optimizar rutas (6 camiones)</button>
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+          <button disabled={ocupado} onClick={generar} style={boton(false)}>Generar recorridos (8 unidades)</button>
+          <button disabled={ocupado || !A} onClick={optimizar} style={boton(true)}>Optimizar rutas (6 camiones)</button>
         </div>
-        {msg && <p style={{ color: '#555' }}>{msg}</p>}
-        {!A && !ocupado && !msg && <p style={{ color: '#666' }}>Todavía no hay recorridos en la base. Tocá "Generar recorridos".</p>}
+        {msg && <p style={{ color: C.suave }}>{msg}</p>}
+        {!A && !ocupado && !msg && <p style={{ color: C.suave }}>Todavía no hay recorridos en la base. Tocá "Generar recorridos".</p>}
 
         {A && (
-          <div style={{ marginTop: 10 }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button onClick={() => setPlay(!play)} style={bt()}>{play ? 'Pausa' : 'Reproducir'}</button>
-              <b>{hh(t)}</b>
-              <label><input type="checkbox" checked={acum} onChange={e => setAcum(e.target.checked)} /> Acumulado</label>
-              <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-                <button onClick={() => { setPlan('actual'); setT(T0) }} style={bt(plan === 'actual' ? { background: '#222', color: '#fff' } : {})}>Plan actual</button>
-                <button disabled={!B} onClick={() => { setPlan('optimizado'); setT(T0) }} style={bt(plan === 'optimizado' ? { background: '#222', color: '#fff' } : {})}>Plan optimizado</button>
-              </span>
+          <>
+            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+              <button onClick={() => { setPlan('actual'); setT(T0) }} style={boton(plan === 'actual', { flex: 1 })}>Plan actual</button>
+              <button disabled={!B} onClick={() => { setPlan('optimizado'); setT(T0) }} style={boton(plan === 'optimizado', { flex: 1 })}>Plan optimizado</button>
             </div>
-            <input type="range" min={T0} max={tFin} step="0.01" value={t} onChange={e => setT(+e.target.value)} style={{ width: '100%', marginTop: 6 }} />
-            <small style={{ color: '#666' }}>El mapa de calor muestra por dónde pasaron los camiones en los últimos 45 minutos. Los puntos negros son las unidades; el azul es el depósito.</small>
-          </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 12 }}>
+              {KPI.map(([l, k, d, u]) => {
+                const dp = vs ? (cur[k] - vs[k]) / vs[k] * 100 : null
+                return (
+                  <div key={k} style={{ background: C.tarjeta, borderRadius: 12, padding: '10px 12px' }}>
+                    <div style={{ color: C.suave, fontSize: 12 }}>{l}</div>
+                    <div style={{ fontSize: 24, fontWeight: 700 }}>{cur[k].toFixed(d)}<span style={{ fontSize: 13, color: C.suave }}>{u}</span></div>
+                    {dp !== null && <div style={{ fontSize: 12, color: dp < 0 ? C.verde : C.rojo }}>{dp < 0 ? '▼' : '▲'} {Math.abs(dp).toFixed(0)} % vs plan actual</div>}
+                  </div>
+                )
+              })}
+            </div>
+
+            <div style={{ background: C.tarjeta, borderRadius: 12, padding: 12, marginTop: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <button onClick={() => setPlay(!play)} style={boton(false)}>{play ? '❚❚ Pausa' : '▶ Reproducir'}</button>
+                <b style={{ fontSize: 22 }}>{hh(t)}</b>
+                <label style={{ marginLeft: 'auto', fontSize: 13 }}><input type="checkbox" checked={acum} onChange={e => setAcum(e.target.checked)} /> Acumulado</label>
+              </div>
+              <input type="range" min={T0} max={tFin} step="0.01" value={t} onChange={e => setT(+e.target.value)} style={{ width: '100%', marginTop: 8 }} />
+              <div style={{ color: C.suave, fontSize: 12 }}>Estelas de colores: un color por camión. Calor: dónde se concentró el paso en los últimos 45 minutos. Punto celeste: depósito.</div>
+            </div>
+          </>
         )}
 
         {A && B && (
-          <>
-            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>
-              <thead><tr><th align="left">Indicador</th><th align="right">Plan actual</th><th align="right">Optimizado</th><th align="right">Mejora</th></tr></thead>
-              <tbody>{TABLA.map(([l, k, d]) => {
-                const a = A[k], b = B[k], p = (a - b) / a * 100
-                return <tr key={k} style={{ borderTop: '1px solid #ddd' }}><td>{l}</td><td align="right">{a.toFixed(d)}</td>
-                  <td align="right"><b>{b.toFixed(d)}</b></td><td align="right" style={{ color: '#1ea046' }}>{p > 0 ? '−' : '+'}{Math.abs(p).toFixed(0)} %</td></tr>
-              })}
-                <tr style={{ borderTop: '1px solid #ddd' }}><td>Fin de la jornada</td><td align="right">{hh(A.fin)}</td><td align="right"><b>{hh(B.fin)}</b></td><td /></tr>
-              </tbody>
-            </table>
-            <div style={{ marginTop: 10 }}>
-              Combustible
-              <div style={{ background: '#c33', color: '#fff', width: '100%', padding: '2px 6px', marginTop: 4 }}>Actual: {A.litros.toFixed(0)} L</div>
-              <div style={{ background: '#1ea046', color: '#fff', width: (B.litros / A.litros * 100) + '%', minWidth: 110, padding: '2px 6px', marginTop: 4 }}>Optimizado: {B.litros.toFixed(0)} L</div>
-            </div>
-            <p style={{ color: '#555', fontSize: 13 }}>
-              Cómo se optimizó (misma demanda de {N_PARADAS} paradas): se agrupan los pedidos por zona alrededor del depósito, se arman viajes de 4 paradas en lugar de 3
-              (consolidación de carga) y se ordena cada recorrido por vecino más cercano. Resultado: menos viajes, menos camiones y menos kilómetros.
-              Datos simulados; distancias en línea recta; consumo supuesto de {L100_FLOTA} L/100 km.
+          <div style={{ background: C.tarjeta, borderRadius: 12, padding: 12, marginTop: 12 }}>
+            <b>Comparación de planes</b>
+            {BARRAS.map(([l, k, u]) => (
+              <div key={k} style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 12, color: C.suave }}>{l}</div>
+                <div style={{ ...barra, background: '#7f1d1d', width: '100%' }}>Actual {A[k].toFixed(0)}{u}</div>
+                <div style={{ ...barra, background: '#166534', width: (B[k] / A[k] * 100) + '%' }}>Optimizado {B[k].toFixed(0)}{u}</div>
+              </div>
+            ))}
+            <div style={{ marginTop: 10, fontSize: 13 }}>Fin de la jornada: {hh(A.fin)} → <b style={{ color: C.verde }}>{hh(B.fin)}</b></div>
+            <p style={{ color: C.suave, fontSize: 12, marginBottom: 0 }}>
+              Misma demanda de {N_PARADAS} paradas. Se agrupan por zona, se consolidan viajes de 4 paradas (antes 3) y cada recorrido se ordena por vecino más cercano.
+              Datos simulados, distancias en línea recta, consumo supuesto de {L100_FLOTA} L/100 km.
             </p>
-          </>
+          </div>
         )}
       </div>
     </div>
