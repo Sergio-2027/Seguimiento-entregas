@@ -7,7 +7,7 @@ import { HeatmapLayer } from '@deck.gl/aggregation-layers'
 
 const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_KEY)
 
-const MAPA_URL = 'https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'  // mapa base oscuro (CARTO / OpenStreetMap)
+const MAPA_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'  // mapa base de OpenStreetMap (se oscurece con tintColor)
 const ATRIB = { position: 'absolute', zIndex: 1, right: 6, bottom: 4, fontSize: 11, color: '#cbd5e1', background: '#0f172acc', padding: '1px 6px', borderRadius: 4 }
 const COLOR = { 'Pendiente': [150,150,150], 'En camino': [255,140,0], 'Entregado': [30,160,70] }
 
@@ -89,7 +89,7 @@ function Tablero() {
       data: MAPA_URL, minZoom: 0, maxZoom: 19, tileSize: 256,
       renderSubLayers: p => {
         const { west, south, east, north } = p.tile.bbox
-        return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] })
+        return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north], tintColor: [80, 95, 125], desaturate: 0.4 })
       }
     }),
     // Gemelo: línea entre la posición real del camión y su destino
@@ -117,7 +117,7 @@ function Tablero() {
       <DeckGL initialViewState={{ longitude: -58.43, latitude: -34.60, zoom: 11.5 }} controller layers={layers}
         getTooltip={({ object: o }) => o && `Pedido: ${o.pedido}\nCliente: ${o.cliente}\nEstado: ${o.estado}\nChofer: ${o.chofer || '-'}\nKm recorridos: ${(o.km_recorridos || 0).toFixed(1)}`} />
 
-      <div style={ATRIB}>© OpenStreetMap · © CARTO</div>
+      <div style={ATRIB}>© OpenStreetMap contributors</div>
       {/* Panel del gemelo digital */}
       <div style={{ position: 'absolute', zIndex: 2, left: 0, right: 0, bottom: 0, background: '#fff',
         boxShadow: '0 -2px 6px #0003', padding: 12, maxHeight: abierto ? '42%' : 'auto', overflowY: 'auto' }}>
@@ -408,7 +408,7 @@ function Flota() {
       data: MAPA_URL, minZoom: 0, maxZoom: 19, tileSize: 256,
       renderSubLayers: p => {
         const { west, south, east, north } = p.tile.bbox
-        return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] })
+        return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north], tintColor: [80, 95, 125], desaturate: 0.4 })
       }
     }),
     ...(calor.length ? [new HeatmapLayer({ id: 'calor', data: calor, getPosition: d => [d.lng, d.lat], getWeight: 1,
@@ -429,7 +429,7 @@ function Flota() {
     <div style={{ position: 'fixed', inset: 0 }}>
       <DeckGL initialViewState={movil ? { longitude: -58.65, latitude: -34.62, zoom: 8.8 } : { longitude: -58.83, latitude: -34.48, zoom: 9.6 }}
         controller layers={layers} />
-      <div style={ATRIB}>© OpenStreetMap · © CARTO</div>
+      <div style={ATRIB}>© OpenStreetMap contributors</div>
       <div style={{ position: 'absolute', zIndex: 2, ...panel, background: C.fondo, color: C.texto, padding: 16, overflowY: 'auto', fontSize: 14, boxShadow: '0 0 18px #0008' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div><div style={{ fontSize: 18, fontWeight: 700 }}>Flota y optimización</div>
