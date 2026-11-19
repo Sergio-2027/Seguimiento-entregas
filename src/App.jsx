@@ -1,323 +1,187 @@
-import { useEffect, useState, useRef, useCallback } from 'react'
-import { createClient } from '@supabase/supabase-js'
-import DeckGL from '@deck.gl/react'
-import { TileLayer } from '@deck.gl/geo-layers'
-import { BitmapLayer, ScatterplotLayer, LineLayer } from '@deck.gl/layers'
+import { ScatterplotLayer, PathLayer } from '@deck.gl/layers'
 
-const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_KEY)
+// ---- Supuestos editables ----
+export const DEPOSITO = { pedido: 'Depósito', lat: -34.6345, lng: -58.4000 } // cambiá por tu depósito real
+const FACTOR_CALLE = 1.3 // la distancia por calle es ~30% mayor que la línea recta
+const DIAS = 30          // días del histórico ficticio
+const CELDA = 0.004      // tamaño de la grilla del mapa de calor (~400 m)
 
-const COLOR = { 'Pendiente': [150,150,150], 'En camino': [255,140,0], 'Entregado': [30,160,70] }
-
-// ---- Gemelo digital: parámetros y cálculos ----
-const VEL_BASE = 25      // km/h supuesta en ciudad (velocidad planificada)
-const L100_BASE = 20     // litros cada 100 km (camión liviano de reparto, supuesto)
-const RALENTI_LH = 1.5   // litros por hora con el camión detenido o en demora (supuesto)
-const SUBIDA_MS = 5000   // cada cuánto el chofer sube su posición a Supabase
-
-const distKm = (lat1, lng1, lat2, lng2) => {
+const dKm = (a, b) => {
   const t = x => x * Math.PI / 180
-  const a = Math.sin(t(lat2 - lat1) / 2) ** 2 +
-    Math.cos(t(lat1)) * Math.cos(t(lat2)) * Math.sin(t(lng2 - lng1) / 2) ** 2
-  return 2 * 6371 * Math.asin(Math.sqrt(a))
-}
-const minutos = (km, vel) => Math.round(km / vel * 60)
-
-// Supabase puede devolver columnas numeric como string: se convierten a número
-const NUM = ['lat', 'lng', 'destino_lat', 'destino_lng', 'km_recorridos', 'consumo_l100']
-const norm = r => {
-  const o = { ...r }
-  for (const k of NUM) if (o[k] !== null && o[k] !== undefined) o[k] = Number(o[k])
-  return o
+  const h = Math.sin(t(b.lat - a.lat) / 2) ** 2 +
+    Math.cos(t(a.lat)) * Math.cos(t(b.lat)) * Math.sin(t(b.lng - a.lng) / 2) ** 2
+  return 2 * 6371 * Math.asin(Math.sqrt(h))
 }
 
-// Réplica virtual de cada viaje: toma datos reales y calcula ETA, odómetro y combustible
-function gemelo(rows, vel) {
-  return rows.map(r => {
-    const l100 = r.consumo_l100 || L100_BASE
-    const km = r.km_recorridos || 0                 // odómetro (real, medido por GPS)
-    const usado = km * l100 / 100                   // combustible ya consumido
-    if (r.estado !== 'En camino' || !r.lat) return { ...r, dist: null, km, usado }
-    const dist = distKm(r.lat, r.lng, r.destino_lat, r.destino_lng)
-    const plan = minutos(dist, VEL_BASE)
-    const sim = minutos(dist, vel)
-    const demora = sim - plan
-    // combustible que falta: distancia restante + ralentí por la demora simulada
-    const restante = dist * l100 / 100 + Math.max(0, demora) / 60 * RALENTI_LH
-    return { ...r, dist, plan, sim, demora, km, usado, restante, total: usado + restante }
-  })
-}
+// Aleatorio con semilla: el histórico es ficticio pero siempre da lo mismo
+const rng = seed => () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646 }
 
-// Carga inicial + cambios en tiempo real aplicados fila por fila (sin releer toda la tabla)
-function useEntregas() {
-  const [rows, setRows] = useState([])
-
-  const recargar = useCallback(async () => {
-    const { data, error } = await supabase.from('entregas').select('*').order('id')
-    if (error) return console.error(error)
-    setRows((data || []).map(norm))
-  }, [])
-
-  useEffect(() => {
-    recargar()
-    const ch = supabase.channel('entregas-rt')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'entregas' }, p => {
-        setRows(prev => {
-          if (p.eventType === 'DELETE') return prev.filter(r => r.id !== p.old.id)
-          const nueva = norm(p.new)
-          const i = prev.findIndex(r => r.id === nueva.id)
-          if (i === -1) return [...prev, nueva].sort((a, b) => a.id - b.id)
-          const copia = [...prev]
-          copia[i] = nueva
-          return copia
-        })
-      })
-      // al (re)conectar se relee todo, por si se perdieron eventos mientras no había conexión
-      .subscribe(status => { if (status === 'SUBSCRIBED') recargar() })
-    return () => { supabase.removeChannel(ch) }
-  }, [recargar])
-
-  return [rows, recargar]
-}
-
-/* ---------------- TABLERO (seguimiento + gemelo digital) ---------------- */
-function Tablero() {
-  const [rows] = useEntregas()
-  const [vel, setVel] = useState(VEL_BASE)
-  const [abierto, setAbierto] = useState(true)
-  const twin = gemelo(rows, vel)
-  const enCamino = twin.filter(r => r.estado === 'En camino')
-  const kmTotal = twin.reduce((s, r) => s + r.km, 0)
-  const litrosTotal = twin.reduce((s, r) => s + r.usado, 0)
-
-  const kpis = [
-    ['Pedidos', rows.length],
-    ['En camino', enCamino.length],
-    ['Entregados', rows.filter(r => r.estado === 'Entregado').length],
-    ['Km recorridos', kmTotal.toFixed(1)],
-    ['Combustible usado (L)', litrosTotal.toFixed(1)],
-  ]
-
-  const reiniciar = async () => {
-    if (!confirm('¿Reiniciar todos los viajes a "Pendiente"?')) return
-    const { error } = await supabase.from('entregas')
-      .update({ estado: 'Pendiente', chofer: null, lat: null, lng: null, km_recorridos: 0, actualizado: new Date().toISOString() })
-      .neq('estado', 'Pendiente')
-    if (error) alert('No se pudo reiniciar: ' + error.message)
+const mezclar = (arr, r) => {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]
   }
+  return a
+}
 
-  const layers = [
-    new TileLayer({
-      id: 'mapa-base',
-      data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', minZoom: 0, maxZoom: 19, tileSize: 256,
-      renderSubLayers: p => {
-        const { west, south, east, north } = p.tile.bbox
-        return new BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] })
+// Largo de la ruta: depósito -> paradas -> depósito
+const largoKm = ruta => {
+  let t = 0, prev = DEPOSITO
+  for (const p of ruta) { t += dKm(prev, p); prev = p }
+  return (t + dKm(prev, DEPOSITO)) * FACTOR_CALLE
+}
+
+// Optimización: vecino más cercano + mejora 2-opt
+function optimizar(paradas) {
+  let resto = [...paradas], ruta = [], actual = DEPOSITO
+  while (resto.length) {
+    let i = 0
+    resto.forEach((p, j) => { if (dKm(actual, p) < dKm(actual, resto[i])) i = j })
+    actual = resto.splice(i, 1)[0]
+    ruta.push(actual)
+  }
+  let mejora = true
+  while (mejora) {
+    mejora = false
+    for (let i = 0; i < ruta.length - 1; i++) {
+      for (let j = i + 1; j < ruta.length; j++) {
+        const nuevo = [...ruta.slice(0, i), ...ruta.slice(i, j + 1).reverse(), ...ruta.slice(j + 1)]
+        if (largoKm(nuevo) < largoKm(ruta) - 1e-9) { ruta = nuevo; mejora = true }
       }
-    }),
-    // Gemelo: línea entre la posición real del camión y su destino
-    new LineLayer({ id: 'trayecto', data: enCamino.filter(r => r.dist !== null),
-      getSourcePosition: d => [d.lng, d.lat], getTargetPosition: d => [d.destino_lng, d.destino_lat],
-      getColor: [255, 140, 0], getWidth: 3, widthUnits: 'pixels' }),
-    new ScatterplotLayer({ id: 'destinos', data: rows, pickable: true,
-      getPosition: d => [d.destino_lng, d.destino_lat], getFillColor: d => COLOR[d.estado] || [150,150,150],
-      getRadius: 10, radiusUnits: 'pixels' }),
-    new ScatterplotLayer({ id: 'choferes', data: rows.filter(r => r.lat && r.estado === 'En camino'), pickable: true,
-      getPosition: d => [d.lng, d.lat], getFillColor: [220,30,30], getLineColor: [255,255,255],
-      stroked: true, lineWidthMinPixels: 3, getRadius: 14, radiusUnits: 'pixels' }),
+    }
+  }
+  return ruta
+}
+
+export function calcularAnalisis(rows, vel, l100) {
+  const paradas = rows.filter(r => r.destino_lat && r.destino_lng)
+    .map(r => ({ id: r.id, pedido: r.pedido, cliente: r.cliente, lat: r.destino_lat, lng: r.destino_lng }))
+  if (paradas.length < 3) return null
+  const r = rng(12345)
+
+  // Histórico ficticio: cada día se visitan los mismos clientes en un orden sin criterio
+  const dias = Array.from({ length: DIAS }, () => {
+    const orden = mezclar(paradas, r)
+    return { orden, km: largoKm(orden) }
+  })
+  const kmProm = dias.reduce((s, d) => s + d.km, 0) / DIAS
+  const tipico = dias.reduce((m, d) => Math.abs(d.km - kmProm) < Math.abs(m.km - kmProm) ? d : m)
+
+  const despues = optimizar(paradas)
+  const m = km => ({ km, min: km / vel * 60, litros: km * l100 / 100 })
+
+  // Mapa de calor: entregas históricas (con dispersión) agrupadas en una grilla
+  const mapa = new Map()
+  let total = 0
+  for (let d = 0; d < DIAS; d++) for (const p of paradas) {
+    const n = 1 + Math.floor(r() * 3)
+    for (let k = 0; k < n; k++) {
+      const la = Math.round((p.lat + (r() - 0.5) * 0.008) / CELDA)
+      const lo = Math.round((p.lng + (r() - 0.5) * 0.008) / CELDA)
+      const key = la + '_' + lo
+      const c = mapa.get(key) || { pos: [lo * CELDA, la * CELDA], n: 0 }
+      c.n++; total++; mapa.set(key, c)
+    }
+  }
+  const lista = [...mapa.values()]
+  const max = Math.max(...lista.map(c => c.n))
+  const celdas = lista.map(c => {
+    const t = c.n / max
+    return { ...c, color: [255, Math.round(230 * (1 - t)), 0, Math.round(70 + 150 * t)] }
+  })
+
+  return { antes: tipico.orden, despues, mAntes: m(kmProm), mDespues: m(largoKm(despues)), celdas, total }
+}
+
+export function capasAnalisis(modo, vista, A) {
+  if (!A || modo === 'normal') return []
+  if (modo === 'calor') {
+    return [new ScatterplotLayer({ id: 'calor', data: A.celdas, getPosition: d => d.pos,
+      getFillColor: d => d.color, getRadius: 260, radiusUnits: 'meters' })]
+  }
+  const ruta = vista === 'antes' ? A.antes : A.despues
+  const color = vista === 'antes' ? [200, 40, 40] : [30, 160, 70]
+  const camino = [[DEPOSITO.lng, DEPOSITO.lat], ...ruta.map(p => [p.lng, p.lat]), [DEPOSITO.lng, DEPOSITO.lat]]
+  return [
+    new PathLayer({ id: 'ruta', data: [{ camino }], getPath: d => d.camino,
+      getColor: color, getWidth: 5, widthUnits: 'pixels' }),
+    new ScatterplotLayer({ id: 'ruta-paradas', data: ruta, getPosition: d => [d.lng, d.lat],
+      getFillColor: color, getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 2,
+      getRadius: 11, radiusUnits: 'pixels' }),
+    new ScatterplotLayer({ id: 'deposito', data: [DEPOSITO], getPosition: d => [d.lng, d.lat],
+      getFillColor: [20, 20, 20], getLineColor: [255, 255, 255], stroked: true, lineWidthMinPixels: 3,
+      getRadius: 15, radiusUnits: 'pixels' }),
   ]
+}
 
+const boton = on => ({ padding: '6px 10px', borderRadius: 6, border: '1px solid #0a6cff',
+  background: on ? '#0a6cff' : '#fff', color: on ? '#fff' : '#0a6cff', fontSize: 14 })
+
+export function PanelAnalisis({ modo, setModo, vista, setVista, A }) {
+  const caja = { borderTop: '1px solid #ddd', marginTop: 10, paddingTop: 8, fontSize: 14 }
+  const a = A?.mAntes, d = A?.mDespues
+  const fila = (nombre, x, y, dec, unidad) => (
+    <tr key={nombre}>
+      <td>{nombre}</td>
+      <td style={{ textAlign: 'right' }}>{x.toFixed(dec)}</td>
+      <td style={{ textAlign: 'right' }}>{y.toFixed(dec)}</td>
+      <td style={{ textAlign: 'right', color: '#1ea046' }}>-{(x - y).toFixed(dec)} {unidad}</td>
+    </tr>
+  )
   return (
-    <div style={{ position: 'fixed', inset: 0 }}>
-      <div style={{ position: 'absolute', zIndex: 2, top: 0, left: 0, right: 0, background: '#fff', padding: 12, boxShadow: '0 2px 6px #0003' }}>
-        <h2 style={{ margin: 0 }}>Seguimiento de Entregas en Vivo</h2>
-        <div style={{ display: 'flex', gap: 24, marginTop: 8, flexWrap: 'wrap' }}>
-          {kpis.map(([l, v]) => <div key={l}><b style={{ fontSize: 28 }}>{v}</b><div style={{ fontSize: 12 }}>{l}</div></div>)}
-          <a href="#/chofer" style={{ marginLeft: 'auto', alignSelf: 'center' }}>Ir a app chofer →</a>
-        </div>
-      </div>
-
-      <DeckGL initialViewState={{ longitude: -58.43, latitude: -34.60, zoom: 11.5 }} controller layers={layers}
-        getTooltip={({ object: o }) => o && `Pedido: ${o.pedido}\nCliente: ${o.cliente}\nEstado: ${o.estado}\nChofer: ${o.chofer || '-'}\nKm recorridos: ${(o.km_recorridos || 0).toFixed(1)}`} />
-
-      {/* Panel del gemelo digital */}
-      <div style={{ position: 'absolute', zIndex: 2, left: 0, right: 0, bottom: 0, background: '#fff',
-        boxShadow: '0 -2px 6px #0003', padding: 12, maxHeight: abierto ? '42%' : 'auto', overflowY: 'auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <b style={{ fontSize: 16 }}>Gemelo digital</b>
-          <button onClick={reiniciar} style={{ marginLeft: 'auto', padding: '6px 10px', borderRadius: 6, border: '1px solid #c33', background: '#fff', color: '#c33' }}>
-            Reiniciar viajes
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button style={boton(modo === 'calor')} onClick={() => setModo(modo === 'calor' ? 'normal' : 'calor')}>
+          Mapa de calor
+        </button>
+        <button style={boton(modo === 'ruta')} onClick={() => { setModo(modo === 'ruta' ? 'normal' : 'ruta'); setVista('despues') }}>
+          Optimizar rutas
+        </button>
+        {modo === 'ruta' && (
+          <button style={boton(true)} onClick={() => setVista(vista === 'antes' ? 'despues' : 'antes')}>
+            Antes / Después
           </button>
-          <button onClick={() => setAbierto(!abierto)} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid #999', background: '#fff' }}>
-            {abierto ? 'Ocultar' : 'Mostrar'}
-          </button>
-        </div>
-
-        {abierto && (
-          <>
-            <div style={{ marginTop: 10, fontSize: 14 }}>
-              Simulación de tráfico: velocidad promedio <b>{vel} km/h</b>
-              {vel < VEL_BASE ? ' (con demora)' : vel > VEL_BASE ? ' (tránsito fluido)' : ' (planificada)'}
-              <input type="range" min="8" max="45" value={vel} onChange={e => setVel(+e.target.value)}
-                style={{ width: '100%', display: 'block', marginTop: 4 }} />
-              <button onClick={() => setVel(VEL_BASE)} style={{ fontSize: 12, padding: '2px 8px' }}>Volver a lo planificado</button>
-              <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
-                Supuestos: consumo {L100_BASE} L/100 km · ralentí {RALENTI_LH} L/h en demora
-              </div>
-            </div>
-
-            {enCamino.length === 0 && <p style={{ fontSize: 14, color: '#666' }}>No hay viajes en camino. Iniciá uno desde la app chofer.</p>}
-
-            {enCamino.map(r => (
-              <div key={r.id} style={{ borderTop: '1px solid #ddd', marginTop: 10, paddingTop: 8, fontSize: 14 }}>
-                <b>{r.pedido}</b> – {r.cliente} <small>({r.chofer || 'sin chofer'})</small><br />
-                Odómetro del viaje: <b>{r.km.toFixed(1)} km</b> · Combustible usado: <b>{r.usado.toFixed(1)} L</b><br />
-                {r.dist === null
-                  ? <span style={{ color: '#666' }}>Esperando señal GPS del chofer…</span>
-                  : <>
-                      Distancia al destino: {r.dist.toFixed(1)} km<br />
-                      ETA planificada: {r.plan} min · ETA simulada: <b>{r.sim} min</b>{' '}
-                      <span style={{ color: r.demora > 0 ? '#c33' : r.demora < 0 ? '#1ea046' : '#666' }}>
-                        ({r.demora > 0 ? '+' : ''}{r.demora} min)
-                      </span><br />
-                      Combustible que falta: <b>{r.restante.toFixed(1)} L</b> · Total estimado del viaje: <b>{r.total.toFixed(1)} L</b>
-                    </>}
-              </div>
-            ))}
-          </>
         )}
       </div>
-    </div>
-  )
-}
 
-/* ---------------- APP CHOFER ---------------- */
-function Chofer() {
-  const [rows, recargar] = useEntregas()
-  const [nombre, setNombre] = useState(localStorage.getItem('chofer') || '')
-  const [km, setKm] = useState(0)
-  const [aviso, setAviso] = useState('')
-  const kmRef = useRef(0)         // odómetro acumulado del viaje
-  const previo = useRef(null)     // último punto GPS contado
-  const rowsRef = useRef(rows)    // para leer los datos actuales dentro del efecto sin reiniciarlo
-  const detenerRef = useRef(null) // corta el GPS (lo usa "Marcar entregado")
-  rowsRef.current = rows
+      {modo !== 'normal' && !A && (
+        <div style={caja}>Faltan al menos 3 pedidos con destino_lat y destino_lng para calcular.</div>
+      )}
 
-  // El viaje activo se deduce de los datos: sobrevive a recargas de la página
-  const activo = rows.find(r => r.estado === 'En camino' && r.chofer === nombre.trim())
-  const activoId = activo?.id
-
-  const actualizar = (id, campos) =>
-    supabase.from('entregas').update({ ...campos, actualizado: new Date().toISOString() }).eq('id', id)
-
-  // GPS + pantalla encendida mientras haya un viaje activo. Se corta solo al salir de la pantalla.
-  useEffect(() => {
-    if (!activoId) return
-    let vivo = true
-    let wake = null
-    let ultimaSubida = 0
-
-    // retoma el odómetro desde lo guardado en la base
-    kmRef.current = rowsRef.current.find(r => r.id === activoId)?.km_recorridos || 0
-    previo.current = null
-    setKm(kmRef.current)
-    setAviso('')
-
-    const pedirWake = async () => {
-      try {
-        if (!('wakeLock' in navigator)) return
-        const lock = await navigator.wakeLock.request('screen')
-        if (vivo) wake = lock
-        else lock.release().catch(() => {})
-      } catch { /* el navegador puede negarlo: no es crítico */ }
-    }
-    const alVolver = () => { if (vivo && document.visibilityState === 'visible') pedirWake() }
-    pedirWake()
-    document.addEventListener('visibilitychange', alVolver)
-
-    const watchId = navigator.geolocation.watchPosition(
-      pos => {
-        if (!vivo) return
-        const { latitude: la, longitude: lo, accuracy } = pos.coords
-        setAviso('')
-        // Odómetro: suma la distancia entre puntos GPS (ignora señal mala, ruido y saltos)
-        if (accuracy <= 50) {
-          if (!previo.current) previo.current = [la, lo]
-          else {
-            const d = distKm(previo.current[0], previo.current[1], la, lo)
-            if (d >= 0.01) {            // se movió al menos 10 m
-              if (d < 1) kmRef.current += d
-              previo.current = [la, lo]
-            }
-          }
-          setKm(kmRef.current)
-        }
-        // Sube a Supabase como máximo cada SUBIDA_MS
-        if (Date.now() - ultimaSubida < SUBIDA_MS) return
-        ultimaSubida = Date.now()
-        actualizar(activoId, { lat: la, lng: lo, km_recorridos: kmRef.current })
-      },
-      err => setAviso('GPS: ' + err.message),
-      { enableHighAccuracy: true }
-    )
-
-    const detener = () => {
-      if (!vivo) return
-      vivo = false
-      navigator.geolocation.clearWatch(watchId)
-      document.removeEventListener('visibilitychange', alVolver)
-      if (wake) wake.release().catch(() => {})
-    }
-    detenerRef.current = detener
-    return detener
-  }, [activoId])
-
-  const iniciar = async (r) => {
-    const n = nombre.trim()
-    if (!n) return alert('Escribí tu nombre')
-    localStorage.setItem('chofer', n)
-    // solo toma el pedido si sigue "Pendiente" (evita que dos choferes tomen el mismo)
-    const { data, error } = await supabase.from('entregas')
-      .update({ estado: 'En camino', chofer: n, actualizado: new Date().toISOString() })
-      .eq('id', r.id).eq('estado', 'Pendiente').select()
-    if (error) return alert('No se pudo iniciar: ' + error.message)
-    if (!data || data.length === 0) alert('Otro chofer ya tomó este pedido')
-    recargar()
-  }
-
-  const entregar = async (r) => {
-    detenerRef.current?.()   // corta el GPS antes, para que no pise el estado con una posición tardía
-    const { error } = await actualizar(r.id, { estado: 'Entregado', km_recorridos: kmRef.current })
-    if (error) alert('No se pudo marcar como entregado: ' + error.message)
-    recargar()
-  }
-
-  const btn = { padding: '10px 14px', fontSize: 16, borderRadius: 8, border: 0, background: '#0a6cff', color: '#fff' }
-
-  return (
-    <div style={{ maxWidth: 480, margin: '0 auto', padding: 16 }}>
-      <h2>App Chofer</h2>
-      <input placeholder="Tu nombre" value={nombre} onChange={e => setNombre(e.target.value)}
-        disabled={!!activo}
-        style={{ width: '100%', padding: 10, fontSize: 16, boxSizing: 'border-box' }} />
-      <p><a href="#/">← Ver tablero</a></p>
-      {aviso && <p style={{ color: '#c33', fontSize: 14 }}>{aviso}</p>}
-      {rows.filter(r => r.estado !== 'Entregado').map(r => (
-        <div key={r.id} style={{ border: '1px solid #ccc', borderRadius: 8, padding: 12, marginBottom: 10 }}>
-          <b>{r.pedido}</b> – {r.cliente}<br />
-          <small>Estado: {r.estado} {r.chofer && `(${r.chofer})`}</small><br />
-          {activoId === r.id && <small>Odómetro del viaje: <b>{km.toFixed(2)} km</b></small>}<br />
-          {activoId === r.id
-            ? <button style={{ ...btn, background: '#1ea046' }} onClick={() => entregar(r)}>Marcar entregado</button>
-            : r.estado === 'Pendiente' && !activo && <button style={btn} onClick={() => iniciar(r)}>Iniciar viaje</button>}
+      {modo === 'calor' && A && (
+        <div style={caja}>
+          <b>Mapa de calor</b>: {A.total} entregas de los últimos {DIAS} días (histórico ficticio).
+          Rojo intenso = zonas con más entregas; amarillo = menos.
         </div>
-      ))}
+      )}
+
+      {modo === 'ruta' && A && (
+        <div style={caja}>
+          <b style={{ color: vista === 'antes' ? '#c33' : '#1ea046' }}>
+            {vista === 'antes' ? 'ANTES: ruta del histórico (rojo)' : 'DESPUÉS: ruta optimizada (verde)'}
+          </b>
+          <table style={{ width: '100%', marginTop: 6, fontSize: 13, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ textAlign: 'right', color: '#666' }}>
+                <th style={{ textAlign: 'left' }}>Por día</th><th>Antes</th><th>Después</th><th>Ahorro</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fila('Distancia', a.km, d.km, 1, 'km')}
+              {fila('Tiempo', a.min, d.min, 0, 'min')}
+              {fila('Combustible', a.litros, d.litros, 1, 'L')}
+            </tbody>
+          </table>
+          <div style={{ marginTop: 6 }}>
+            Mejora: <b>{((a.km - d.km) / a.km * 100).toFixed(0)}%</b> menos recorrido ·
+            en {DIAS} días: <b>{((a.km - d.km) * DIAS).toFixed(0)} km</b> y <b>{((a.litros - d.litros) * DIAS).toFixed(0)} L</b> menos.
+          </div>
+          <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
+            Histórico ficticio: mismos clientes en orden sin criterio. Optimización: vecino más cercano + 2-opt.
+            Distancia por calle estimada como línea recta x {FACTOR_CALLE}.
+          </div>
+        </div>
+      )}
     </div>
   )
 }
-
-export default function App() {
-  const [ruta, setRuta] = useState(location.hash)
-  useEffect(() => { const f = () => setRuta(location.hash); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f) }, [])
-  return ruta === '#/chofer' ? <Chofer /> : <Tablero />
-}
-
