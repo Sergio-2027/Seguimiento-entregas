@@ -170,76 +170,150 @@ function Tablero() {
 }
 
 /* ---------------- APP CHOFER ---------------- */
+const Dato = ({ l, v }) => (
+  <div style={{ background: '#0f172a', borderRadius: 10, padding: '8px 10px' }}>
+    <div style={{ color: '#94a3b8', fontSize: 11 }}>{l}</div><div style={{ fontSize: 18, fontWeight: 700 }}>{v}</div>
+  </div>
+)
+const GPS_ESTADOS = { apagado: ['GPS apagado', '#64748b'], buscando: ['Buscando señal…', '#facc15'], ok: ['GPS activo', '#4ade80'],
+  debil: ['Señal débil', '#fb923c'], error: ['Sin permiso de GPS', '#f87171'] }
+
 function Chofer() {
   const rows = useEntregas()
   const [nombre, setNombre] = useState(localStorage.getItem('chofer') || '')
   const [activo, setActivo] = useState(null)
   const [km, setKm] = useState(0)
-  const watch = useRef(null)
-  const ultimo = useRef(0)
-  const kmRef = useRef(0)     // odómetro acumulado del viaje
-  const previo = useRef(null) // último punto GPS contado
+  const [pos, setPos] = useState(null)
+  const [gps, setGps] = useState('apagado')
+  const watch = useRef(null), ultimo = useRef(0), kmRef = useRef(0), previo = useRef(null), lock = useRef(null)
+  const yo = nombre.trim()
 
   const actualizar = (id, campos) =>
     supabase.from('entregas').update({ ...campos, actualizado: new Date().toISOString() }).eq('id', id)
 
-  const iniciar = async (r) => {
-    if (!nombre) return alert('Escribí tu nombre')
-    localStorage.setItem('chofer', nombre)
-    setActivo(r.id)
-    kmRef.current = r.km_recorridos || 0
-    previo.current = null
-    setKm(kmRef.current)
-    await actualizar(r.id, { estado: 'En camino', chofer: nombre })
-    watch.current = navigator.geolocation.watchPosition(
-      pos => {
-        if (Date.now() - ultimo.current < 3000) return
-        ultimo.current = Date.now()
-        const { latitude: la, longitude: lo, accuracy } = pos.coords
-        // Odómetro: suma la distancia entre puntos GPS (ignora señal mala, ruido y saltos)
-        if (accuracy <= 50) {
-          if (!previo.current) previo.current = [la, lo]
-          else {
-            const d = distKm(previo.current[0], previo.current[1], la, lo)
-            if (d >= 0.01) {            // se movió al menos 10 m
-              if (d < 1) kmRef.current += d
-              previo.current = [la, lo]
-            }
-          }
-          setKm(kmRef.current)
+  // Mantiene la pantalla encendida mientras se sigue el viaje (el GPS necesita el navegador abierto)
+  const pantalla = async () => { try { if (navigator.wakeLock) lock.current = await navigator.wakeLock.request('screen') } catch {} }
+  const soltar = () => { try { lock.current?.release() } catch {} lock.current = null }
+  useEffect(() => {
+    const f = () => { if (document.visibilityState === 'visible' && watch.current != null) pantalla() }
+    document.addEventListener('visibilitychange', f)
+    return () => { document.removeEventListener('visibilitychange', f); if (watch.current != null) navigator.geolocation.clearWatch(watch.current); soltar() }
+  }, [])
+
+  const seguir = (r) => {
+    setActivo(r.id); kmRef.current = r.km_recorridos || 0; previo.current = null; setKm(kmRef.current)
+    setGps('buscando'); pantalla()
+    if (watch.current != null) navigator.geolocation.clearWatch(watch.current)
+    watch.current = navigator.geolocation.watchPosition(p => {
+      const { latitude: la, longitude: lo, accuracy } = p.coords
+      setPos({ lat: la, lng: lo }); setGps(accuracy <= 50 ? 'ok' : 'debil')
+      if (Date.now() - ultimo.current < 3000) return
+      ultimo.current = Date.now()
+      if (accuracy <= 50) {            // odómetro: ignora señal mala, ruido y saltos
+        if (!previo.current) previo.current = [la, lo]
+        else {
+          const d = distKm(previo.current[0], previo.current[1], la, lo)
+          if (d >= 0.01) { if (d < 1) kmRef.current += d; previo.current = [la, lo] }
         }
-        actualizar(r.id, { lat: la, lng: lo, km_recorridos: kmRef.current })
-      },
-      err => alert('GPS: ' + err.message), { enableHighAccuracy: true })
+        setKm(kmRef.current)
+      }
+      actualizar(r.id, { lat: la, lng: lo, km_recorridos: kmRef.current })
+    }, () => setGps('error'), { enableHighAccuracy: true })
   }
 
+  const iniciar = async (r) => {
+    if (!yo) return alert('Escribí tu nombre primero')
+    localStorage.setItem('chofer', yo)
+    const { data } = await supabase.from('entregas')   // solo lo toma si sigue Pendiente
+      .update({ estado: 'En camino', chofer: yo, actualizado: new Date().toISOString() })
+      .eq('id', r.id).eq('estado', 'Pendiente').select()
+    if (!data || !data.length) return alert('Otro chofer ya tomó este pedido')
+    seguir(r)
+  }
   const entregar = async (r) => {
-    navigator.geolocation.clearWatch(watch.current)
+    if (!confirm(`¿Confirmás la entrega de ${r.pedido} a ${r.cliente}?`)) return
+    if (watch.current != null) navigator.geolocation.clearWatch(watch.current)
+    watch.current = null; soltar()
     await actualizar(r.id, { estado: 'Entregado', km_recorridos: kmRef.current })
-    setActivo(null)
+    setActivo(null); setGps('apagado'); setPos(null)
   }
 
-  const btn = { padding: '10px 14px', fontSize: 16, borderRadius: 8, border: 0, background: '#0a6cff', color: '#fff' }
+  const enCurso = yo ? rows.find(r => r.estado === 'En camino' && r.chofer === yo) : null
+  const pendientes = rows.filter(r => r.estado === 'Pendiente')
+  const hechos = yo ? rows.filter(r => r.estado === 'Entregado' && r.chofer === yo) : []
+  const kmDia = hechos.reduce((s, r) => s + (r.km_recorridos || 0), 0) + (enCurso ? (activo === enCurso.id ? km : enCurso.km_recorridos || 0) : 0)
+  const [gTxt, gCol] = GPS_ESTADOS[gps]
+  const tarjeta = { background: C.tarjeta, borderRadius: 14, padding: 14, marginTop: 12 }
+  const grande = (bg, col = '#0f172a') => ({ display: 'block', width: '100%', boxSizing: 'border-box', textAlign: 'center', padding: 14, fontSize: 16,
+    fontWeight: 700, borderRadius: 10, border: 0, background: bg, color: col, marginTop: 10, textDecoration: 'none' })
 
   return (
-    <div style={{ maxWidth: 480, margin: '0 auto', padding: 16 }}>
-      <h2>App Chofer</h2>
-      <input placeholder="Tu nombre" value={nombre} onChange={e => setNombre(e.target.value)}
-        style={{ width: '100%', padding: 10, fontSize: 16, boxSizing: 'border-box' }} />
-      <p><a href="#/">← Ver tablero</a></p>
-      {rows.filter(r => r.estado !== 'Entregado').map(r => (
-        <div key={r.id} style={{ border: '1px solid #ccc', borderRadius: 8, padding: 12, marginBottom: 10 }}>
-          <b>{r.pedido}</b> – {r.cliente}<br />
-          <small>Estado: {r.estado} {r.chofer && `(${r.chofer})`}</small><br />
-          {activo === r.id && <small>Odómetro del viaje: <b>{km.toFixed(2)} km</b></small>}<br />
-          {activo === r.id
-            ? <button style={{ ...btn, background: '#1ea046' }} onClick={() => entregar(r)}>Marcar entregado</button>
-            : r.estado === 'Pendiente' && <button style={btn} onClick={() => iniciar(r)}>Iniciar viaje</button>}
+    <div style={{ minHeight: '100vh', background: C.fondo, color: C.texto, padding: 16, boxSizing: 'border-box' }}>
+      <div style={{ maxWidth: 480, margin: '0 auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ fontSize: 20, fontWeight: 700 }}>App Chofer</div>
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: gCol, border: '1px solid ' + gCol, borderRadius: 20, padding: '3px 10px' }}>● {gTxt}</span>
         </div>
-      ))}
+        <input placeholder="Tu nombre" value={nombre} onChange={e => setNombre(e.target.value)}
+          style={{ width: '100%', boxSizing: 'border-box', padding: 12, fontSize: 16, marginTop: 12, borderRadius: 10, border: '1px solid #334155', background: C.tarjeta, color: C.texto }} />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 12 }}>
+          <Dato l="Entregas hechas" v={hechos.length} />
+          <Dato l="Km del día" v={kmDia.toFixed(1)} />
+          <Dato l="Combustible (L)" v={(kmDia * L100_BASE / 100).toFixed(1)} />
+        </div>
+
+        {enCurso && (() => {
+          const escucha = activo === enCurso.id
+          const dist = pos ? distKm(pos.lat, pos.lng, enCurso.destino_lat, enCurso.destino_lng) : null
+          return (
+            <div style={{ ...tarjeta, border: '1px solid ' + C.azul }}>
+              <div style={{ color: C.azul, fontSize: 12, fontWeight: 700 }}>VIAJE EN CURSO</div>
+              <div style={{ fontSize: 20, fontWeight: 700, margin: '4px 0 10px' }}>{enCurso.pedido} · {enCurso.cliente}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <Dato l="Odómetro del viaje" v={(escucha ? km : enCurso.km_recorridos || 0).toFixed(2) + ' km'} />
+                <Dato l="Combustible usado" v={((escucha ? km : enCurso.km_recorridos || 0) * L100_BASE / 100).toFixed(2) + ' L'} />
+                <Dato l="Distancia al destino" v={dist !== null ? dist.toFixed(1) + ' km' : '—'} />
+                <Dato l="Llegada estimada" v={dist !== null ? minutos(dist, VEL_BASE) + ' min' : '—'} />
+              </div>
+              {dist !== null && dist < 0.15 && <p style={{ color: C.verde, marginBottom: 0 }}>Estás llegando al destino.</p>}
+              {escucha ? (
+                <>
+                  <a href={`https://www.google.com/maps/dir/?api=1&destination=${enCurso.destino_lat},${enCurso.destino_lng}&travelmode=driving`}
+                    target="_blank" rel="noreferrer" style={grande(C.azul)}>Navegar al destino</a>
+                  <button onClick={() => entregar(enCurso)} style={grande('#16a34a', '#fff')}>Marcar entregado</button>
+                </>
+              ) : <button onClick={() => seguir(enCurso)} style={grande('#f59e0b')}>Reanudar seguimiento</button>}
+            </div>
+          )
+        })()}
+
+        {!enCurso && (
+          <>
+            <div style={{ marginTop: 16, fontWeight: 700 }}>Pedidos disponibles ({pendientes.length})</div>
+            {pendientes.length === 0 && <p style={{ color: C.suave }}>No quedan pedidos pendientes. ¡Buen trabajo!</p>}
+            {pendientes.map(r => (
+              <div key={r.id} style={tarjeta}>
+                <div style={{ fontWeight: 700 }}>{r.pedido}</div>
+                <div style={{ color: C.suave, fontSize: 14 }}>{r.cliente}</div>
+                <button onClick={() => iniciar(r)} style={grande(C.azul)}>Iniciar viaje</button>
+              </div>
+            ))}
+          </>
+        )}
+        {enCurso && <p style={{ color: C.suave, fontSize: 13 }}>Terminá el viaje en curso para tomar otro pedido.</p>}
+
+        {hechos.length > 0 && (
+          <div style={tarjeta}>
+            <b>Entregados hoy ({hechos.length})</b>
+            {hechos.map(r => <div key={r.id} style={{ color: C.suave, fontSize: 13, marginTop: 4 }}>✓ {r.pedido} · {r.cliente} · {(r.km_recorridos || 0).toFixed(1)} km</div>)}
+          </div>
+        )}
+        <p style={{ textAlign: 'center', marginTop: 16 }}><a href="#/" style={{ color: C.azul }}>Ver tablero</a></p>
+      </div>
     </div>
   )
 }
+
 
 // ---- Flota: demanda simulada, plan actual y plan optimizado ----
 const DEPOSITO = { lat: -34.4600, lng: -58.6350 }   // Depósito en General Pacheco
