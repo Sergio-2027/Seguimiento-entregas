@@ -434,7 +434,8 @@ function Flota() {
   useEffect(() => { cargar() }, [])
 
   const guardar = async (escenario, nuevas) => {
-    await supabase.from('recorridos').delete().eq('escenario', escenario)
+    const { error: errBorrar } = await supabase.from('recorridos').delete().eq('escenario', escenario)
+    if (errBorrar) throw errBorrar
     for (let i = 0; i < nuevas.length; i += 500) {
       const { error } = await supabase.from('recorridos').insert(nuevas.slice(i, i + 500))
       if (error) throw error
@@ -443,7 +444,7 @@ function Flota() {
   const correr = async (texto, tarea, planNuevo) => {
     setOcupado(true); setMsg(texto)
     try { await tarea(); await cargar(); setPlan(planNuevo); setT(T0); setMsg('') }
-    catch (e) { setMsg('Error: ' + e.message) }
+    catch (e) { console.error(e); setMsg('Error: ' + (e.message || JSON.stringify(e))) }
     setOcupado(false)
   }
   const generar = () => correr('Generando los recorridos de las 8 unidades…', async () => {
@@ -458,8 +459,8 @@ function Flota() {
     return { porPlan: p, tFin: filas.length ? Math.max(...filas.map(f => f.hora)) + 0.3 : 18,
       stats: { actual: p.actual.length ? estadisticas(p.actual) : null, optimizado: p.optimizado.length ? estadisticas(p.optimizado) : null } }
   }, [filas])
-  const activos = porPlan[plan]
-  const A = stats.actual, B = stats.optimizado, cur = stats[plan], vs = plan === 'optimizado' ? A : null
+  const activos = stats[plan] ? porPlan[plan] : porPlan.actual
+  const A = stats.actual, B = stats.optimizado, cur = stats[plan] || A, vs = plan === 'optimizado' && B ? A : null
 
   useEffect(() => {
     if (!play) return
